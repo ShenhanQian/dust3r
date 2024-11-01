@@ -267,17 +267,17 @@ def process_scenes(root, pairsdir, output_dir, target_resolution):
         selection_iphone = [imgname + '.jpg' for imgname in selection if imgname.startswith('frame_')]
 
         # resize the image to a more manageable size and render depth
+        skipped_idx_list = []
         for selection_cam, img_idx, img_infos, paths_data, desc in [(selection_dslr, img_idx_dslr, img_infos_dslr, dslr_paths, 'dslr'),
                                                               (selection_iphone, img_idx_iphone, img_infos_iphone, iphone_paths, 'iphone')]:
             rgb_dir = paths_data['in_rgb']
             mask_dir = paths_data['in_mask']
             for imgname in tqdm(selection_cam, position=1, leave=False, desc=desc):
                 if imgname not in img_idx:
-                    skipped += 1
-                    selection_list.remove(imgname.split('.')[0])
+                    idx_in_selection = selection_list.index(imgname.split('.')[0])
+                    skipped_idx_list.append(idx_in_selection)
                     continue
 
-                found += 1
                 imgidx = img_idx[imgname]
                 img_infos_idx = img_infos[imgidx]
                 rgb = np.array(Image.open(os.path.join(rgb_dir, img_infos_idx['path'])))
@@ -314,10 +314,41 @@ def process_scenes(root, pairsdir, output_dir, target_resolution):
                 depth[depth_mask] = 0
                 Image.fromarray(depth).save(depth_outpath)
 
+        # filter out skipped images
+        filtered_selection_list = []
+        for i, imgname in enumerate(selection_list):
+            if i in skipped_idx_list:
+                continue
+            filtered_selection_list.append(imgname)
+        filtered_selection = np.array(filtered_selection_list)
+        found += len(filtered_selection)
+        skipped += len(skipped_idx_list)
+
+        # filter out pairs with skipped images
+        filtered_pairs = []
+        for pair in pairs.tolist():
+            if int(pair[0]) in skipped_idx_list or int(pair[1]) in skipped_idx_list:
+                continue
+            filtered_pairs.append(pair)
+        pairs_idx = np.array(filtered_pairs)[:, :2].astype(np.int64)
+        
+        # get the new idx mapping
+        idx_mapping = []
+        next = 0
+        for i in range(pairs_idx.max() + 1):
+            idx_mapping.append(next)
+            if i not in skipped_idx_list:
+                next += 1
+
+        # update pairs
+        updated_pairs_list = []
+        for i, pair in enumerate(filtered_pairs):
+            updated_pairs_list.append([idx_mapping[int(pair[0])], idx_mapping[int(pair[1])], pair[2]])
+        updated_pairs = np.array(updated_pairs_list)
+
         trajectories = []
         intrinsics = []
-        # for imgname in selection:
-        for imgname in selection_list:
+        for imgname in filtered_selection_list:
             if imgname.startswith('DSC'):
                 imgidx = img_idx_dslr[imgname + '.JPG']
                 img_infos_idx = img_infos_dslr[imgidx]
@@ -336,14 +367,13 @@ def process_scenes(root, pairsdir, output_dir, target_resolution):
         np.savez(scene_metadata_path,
                  trajectories=trajectories,
                  intrinsics=intrinsics,
-                #  images=selection,
-                 images=np.array(selection_list),
-                 pairs=pairs)
+                 images=filtered_selection,
+                 pairs=updated_pairs)
 
         del img_infos
         del pyrender_scene
 
-        print(f"\Found {found} images, skipped {skipped} images, dropping ratio: {skipped / (found+skipped):.2%}")
+        print(f"\Found {found} images, skipped {skipped} images, skipping ratio: {skipped / (found+skipped):.2%}")
 
     # concat all scene_metadata.npz into a single file
     scene_data = {}
