@@ -3,10 +3,9 @@
 # Licensed under CC BY-NC-SA 4.0 (non-commercial use only).
 #
 # --------------------------------------------------------
-# Pre-process the scannet++ dataset.
-# 1) Download the dataset (v1)
-# 2) Extract iphone rgb and mask videos: https://github.com/scannetpp/scannetpp/tree/main#extract-rgb-frames-masks-and-depth-frames
-# 3) Generate pairs: python3 datasets_preprocess/preprocess_scannetpp.py --scannetpp_dir /path/to/scannetpp --precomputed_pairs /path/to/scannetpp_pairs --pyopengl-platform egl
+# Script to pre-process the scannet++ dataset.
+# Usage:
+# python3 datasets_preprocess/preprocess_scannetpp.py --scannetpp_dir /path/to/scannetpp --precomputed_pairs /path/to/scannetpp_pairs --pyopengl-platform egl
 # --------------------------------------------------------
 import os
 import argparse
@@ -22,14 +21,13 @@ import numpy as np
 import cv2
 import PIL.Image as Image
 
-import path_to_root  # noqa
 from dust3r.datasets.utils.cropping import rescale_image_depthmap
 import dust3r.utils.geometry as geometry
 
 inv = np.linalg.inv
 norm = np.linalg.norm
-REGEXPR_DSLR = re.compile(r'^DSC(?P<frameid>\d+).JPG$')
-REGEXPR_IPHONE = re.compile(r'frame_(?P<frameid>\d+).jpg$')
+REGEXPR_DSLR = re.compile(r'^.*DSC(?P<frameid>\d+).JPG$')
+REGEXPR_IPHONE = re.compile(r'.*frame_(?P<frameid>\d+).jpg$')
 
 DEBUG_VIZ = None  # 'iou'
 if DEBUG_VIZ is not None:
@@ -67,8 +65,12 @@ def get_frame_number(name, cam_type='dslr'):
         regex_expr = REGEXPR_IPHONE
     else:
         raise NotImplementedError(f'wrong {cam_type=} for get_frame_number')
-    matches = re.match(regex_expr, name)
-    return matches['frameid']
+    try:
+        matches = re.match(regex_expr, name)
+        return matches['frameid']
+    except Exception as e:
+        print(f'Error when parsing {name}')
+        raise ValueError(f'Invalid name {name}')
 
 
 def load_sfm(sfm_dir, cam_type='dslr'):
@@ -94,6 +96,10 @@ def load_sfm(sfm_dir, cam_type='dslr'):
 
         idx = image[0]
         img_name = image[-1]
+        prefixes = ['iphone/', 'video/']
+        for prefix in prefixes:
+            if img_name.startswith(prefix):
+                img_name = img_name[len(prefix):]
         assert img_name not in img_idx, 'duplicate db image: ' + img_name
         img_idx[img_name] = idx  # register image name
 
@@ -118,6 +124,8 @@ def load_sfm(sfm_dir, cam_type='dslr'):
         points3D[point_3d_idx] = tuple(map(float, point[1:4]))
         if len(point) > 8:
             for idx, point_2d_idx in zip(point[8::2], point[9::2]):
+                if idx not in observations:
+                    continue
                 observations[idx].append((point_3d_idx, int(point_2d_idx)))
 
     return img_idx, img_infos, points3D, observations
@@ -192,23 +200,17 @@ def process_scenes(root, pairsdir, output_dir, target_resolution):
     with open(listfile, 'r') as f:
         scenes = json.load(f)
 
-    found = 0
-    skipped = 0
     # for each of these, we will select some dslr images and some iphone images
     # we will undistort them and render their depth
     renderer = pyrender.OffscreenRenderer(0, 0)
-    for scene in tqdm(scenes, position=0, leave=True, desc='scenes'):
+    for scene in tqdm(scenes, position=0, leave=True):
         data_dir = os.path.join(root, 'data', scene)
         dir_dslr = os.path.join(data_dir, 'dslr')
         dir_iphone = os.path.join(data_dir, 'iphone')
         dir_scans = os.path.join(data_dir, 'scans')
 
-        try:
-            assert os.path.isdir(data_dir) and os.path.isdir(dir_dslr) \
+        assert os.path.isdir(data_dir) and os.path.isdir(dir_dslr) \
             and os.path.isdir(dir_iphone) and os.path.isdir(dir_scans)
-        except AssertionError:
-            print(f"Error: missing directories in {data_dir}")
-            import ipdb; ipdb.set_trace()
 
         output_dir_scene = os.path.join(output_dir, scene)
         scene_metadata_path = osp.join(output_dir_scene, 'scene_metadata.npz')
@@ -262,22 +264,15 @@ def process_scenes(root, pairsdir, output_dir, target_resolution):
         pyrender_scene = pyrender.Scene()
         pyrender_scene.add(mesh)
 
-        selection_list = selection.tolist()
-        selection_dslr = [imgname + '.JPG' for imgname in selection if imgname.startswith('DSC')]
-        selection_iphone = [imgname + '.jpg' for imgname in selection if imgname.startswith('frame_')]
+        selection_iphone = [imgname + '.jpg' for imgname in selection if 'frame_' in imgname]
+        selection_dslr = [imgname + '.JPG' for imgname in selection if not 'frame_' in imgname]
 
         # resize the image to a more manageable size and render depth
-        skipped_idx_list = []
-        for selection_cam, img_idx, img_infos, paths_data, desc in [(selection_dslr, img_idx_dslr, img_infos_dslr, dslr_paths, 'dslr'),
-                                                              (selection_iphone, img_idx_iphone, img_infos_iphone, iphone_paths, 'iphone')]:
+        for selection_cam, img_idx, img_infos, paths_data in [(selection_dslr, img_idx_dslr, img_infos_dslr, dslr_paths),
+                                                              (selection_iphone, img_idx_iphone, img_infos_iphone, iphone_paths)]:
             rgb_dir = paths_data['in_rgb']
             mask_dir = paths_data['in_mask']
-            for imgname in tqdm(selection_cam, position=1, leave=False, desc=desc):
-                if imgname not in img_idx:
-                    idx_in_selection = selection_list.index(imgname.split('.')[0])
-                    skipped_idx_list.append(idx_in_selection)
-                    continue
-
+            for imgname in tqdm(selection_cam, position=1, leave=False):
                 imgidx = img_idx[imgname]
                 img_infos_idx = img_infos[imgidx]
                 rgb = np.array(Image.open(os.path.join(rgb_dir, img_infos_idx['path'])))
@@ -305,7 +300,7 @@ def process_scenes(root, pairsdir, output_dir, target_resolution):
                 camera = pyrender.camera.IntrinsicsCamera(fx, fy, cx, cy, znear=znear, zfar=zfar)
                 camera_node = pyrender_scene.add(camera, pose=img_infos_idx['cam_to_world'] @ OPENGL_TO_OPENCV)
 
-                depth = renderer.render(pyrender_scene, flags=pyrender.RenderFlags.DEPTH_ONLY)
+                _, depth = renderer.render(pyrender_scene, flags=pyrender.RenderFlags.SKIP_CULL_FACES)
                 pyrender_scene.remove_node(camera_node)  # dont forget to remove camera
 
                 depth = (depth * 1000).astype('uint16')
@@ -314,49 +309,17 @@ def process_scenes(root, pairsdir, output_dir, target_resolution):
                 depth[depth_mask] = 0
                 Image.fromarray(depth).save(depth_outpath)
 
-        # filter out skipped images
-        filtered_selection_list = []
-        for i, imgname in enumerate(selection_list):
-            if i in skipped_idx_list:
-                continue
-            filtered_selection_list.append(imgname)
-        filtered_selection = np.array(filtered_selection_list)
-        found += len(filtered_selection)
-        skipped += len(skipped_idx_list)
-
-        # filter out pairs with skipped images
-        filtered_pairs = []
-        for pair in pairs.tolist():
-            if int(pair[0]) in skipped_idx_list or int(pair[1]) in skipped_idx_list:
-                continue
-            filtered_pairs.append(pair)
-        pairs_idx = np.array(filtered_pairs)[:, :2].astype(np.int64)
-        
-        # get the new idx mapping
-        idx_mapping = []
-        next = 0
-        for i in range(pairs_idx.max() + 1):
-            idx_mapping.append(next)
-            if i not in skipped_idx_list:
-                next += 1
-
-        # update pairs
-        updated_pairs_list = []
-        for i, pair in enumerate(filtered_pairs):
-            updated_pairs_list.append([idx_mapping[int(pair[0])], idx_mapping[int(pair[1])], pair[2]])
-        updated_pairs = np.array(updated_pairs_list)
-
         trajectories = []
         intrinsics = []
-        for imgname in filtered_selection_list:
-            if imgname.startswith('DSC'):
-                imgidx = img_idx_dslr[imgname + '.JPG']
-                img_infos_idx = img_infos_dslr[imgidx]
-            elif imgname.startswith('frame_'):
+        for imgname in selection:
+            if 'frame_' in imgname:
                 imgidx = img_idx_iphone[imgname + '.jpg']
                 img_infos_idx = img_infos_iphone[imgidx]
+            elif 'DSC' in imgname:
+                imgidx = img_idx_dslr[imgname + '.JPG']
+                img_infos_idx = img_infos_dslr[imgidx]
             else:
-                raise ValueError('invalid image name')
+                raise ValueError(f'invalid image name {imgname}')
 
             intrinsics.append(img_infos_idx['intrinsics'])
             trajectories.append(img_infos_idx['cam_to_world'])
@@ -367,13 +330,11 @@ def process_scenes(root, pairsdir, output_dir, target_resolution):
         np.savez(scene_metadata_path,
                  trajectories=trajectories,
                  intrinsics=intrinsics,
-                 images=filtered_selection,
-                 pairs=updated_pairs)
+                 images=selection,
+                 pairs=pairs)
 
         del img_infos
         del pyrender_scene
-
-        print(f"\Found {found} images, skipped {skipped} images, skipping ratio: {skipped / (found+skipped):.2%}")
 
     # concat all scene_metadata.npz into a single file
     scene_data = {}
